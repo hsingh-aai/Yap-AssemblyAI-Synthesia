@@ -10,10 +10,9 @@
 //
 // Two decisions do most of the work:
 //
-//  * The base face is a JPEG decoded once, and each mouth is raw RGB565
-//    blitted straight to the panel. Re-decoding a 300 px JPEG every frame
-//    would cost more than the frame budget; pushing a 128x76 sprite costs
-//    about a millisecond.
+//  * Face and mouths are raw RGB565, pushed straight to the panel. The face
+//    was a JPEG once and drew nothing on hardware - see make_avatar.py for
+//    why - and a 128x76 mouth push costs about a millisecond either way.
 //  * The mouth is chosen from the playback *clock*, not from the block being
 //    queued. pumpSpeaker() runs up to 200 ms ahead of the speaker, and a
 //    mouth 200 ms early looks worse than no mouth at all.
@@ -47,7 +46,7 @@ void avatarShow() {
   // fall outside the glass are background colour anyway.
   s_ox = cx - kAvatarSize / 2;
   s_oy = cy - kAvatarSize / 2 - 24;
-  M5.Display.drawJpg(kAvatarBase, kAvatarBaseLen, s_ox, s_oy);
+  M5.Display.pushImage(s_ox, s_oy, kAvatarSize, kAvatarSize, kAvatarBasePix);
   s_level = 0;
   s_env = 0;
   s_t0 = 0;

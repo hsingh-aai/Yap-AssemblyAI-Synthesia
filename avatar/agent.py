@@ -121,6 +121,20 @@ def prewarm(proc) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
+
+    # Don't start an avatar for an empty room. A browser that opens the room
+    # and then fails - mic permission denied is the usual one - leaves the
+    # agent here alone, and on a one-concurrent-session plan an avatar idling
+    # in that room locks the face for everyone else until someone notices.
+    # That happened twice while building this. Wait for a person; give up if
+    # none arrives.
+    try:
+        await asyncio.wait_for(ctx.wait_for_participant(), timeout=30)
+    except asyncio.TimeoutError:
+        log.info("nobody joined %s within 30 s; not starting an avatar", ctx.room.name)
+        ctx.shutdown(reason="no participant")
+        return
+
     # Off the event loop: a blocking fetch here stalled the agent's audio loop
     # for 277 ms on the first run, and LiveKit said so.
     instructions, greeting = await asyncio.to_thread(load_persona)

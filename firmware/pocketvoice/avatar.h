@@ -5,11 +5,11 @@
 
 static constexpr int kAvatarSize   = 300;
 static constexpr int kMouthLevels  = 6;
-static constexpr int kMouthX       = 86;
-static constexpr int kMouthY       = 176;
-static constexpr int kMouthW       = 128;
-static constexpr int kMouthH       = 76;
+static constexpr int kMouthX       = 112;
+static constexpr int kMouthY       = 160;
+static constexpr int kMouthW       = 76;
+static constexpr int kMouthH       = 52;
 
-extern const uint8_t  kAvatarBase[];
-extern const size_t   kAvatarBaseLen;
+// RGB565, byte-swapped for the panel; pushImage() these as they are.
+extern const uint16_t kAvatarBasePix[kAvatarSize * kAvatarSize];
 extern const uint16_t kMouthPix[kMouthLevels][kMouthW * kMouthH];

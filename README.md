@@ -491,10 +491,13 @@ people notice only once the timing is already right.
 
 Two decisions carry it:
 
-* **The base face is a JPEG decoded once; each mouth is raw RGB565 blitted
-  straight to the panel.** Re-decoding a 300 px JPEG every frame costs more
-  than the whole frame budget. Pushing a 128×76 sprite costs about a
-  millisecond, so 20 fps is free and the frame rate is set by taste.
+* **Face and mouths are raw RGB565, pushed straight to the panel.** The
+  face started as a JPEG and drew *nothing* on hardware: ffmpeg had encoded
+  it with 1x2 sampling on all three components, which the board's decoder
+  doesn't support, and it fails silently. Raw pixels cost more flash and
+  can't fail that way. They are also stored byte-swapped — M5GFX reads a
+  `uint16_t` image as big-endian RGB565, and native words turned the
+  pumpkin's orange into magenta and blue on the first run.
 * **The mouth is clocked from playback, not from the queue.** `pumpSpeaker()`
   runs up to 200 ms ahead of the speaker, so driving the mouth from the block
   being queued would put it 200 ms early — worse than no mouth at all. The
@@ -526,7 +529,7 @@ its mouth, deliberately fed through the same pipeline so the day a real
 render arrives nothing changes but the filename. It is also reasonable to
 ship — Jack is a three-hundred-year-old pumpkin.
 
-The face costs 123 KB of flash, taking the build from 43% to 47%.
+The face costs 290 KB of flash, taking the build from 43% to 52%.
 
 ## Blurt's slowness was never the transcription
 
@@ -599,11 +602,21 @@ an out-of-range AP — both arrive as `WL_DISCONNECTED` — but the
 difference between a user retyping and a user giving up.
 
 The chosen network goes into NVS under the `pocketvoice` namespace, so a
-device is told once. Boot order is: saved credentials, then the `secrets.h`
-prefix if it is still set, then the picker. The bench network is only ever
+device is told once. Boot scans **once** and then decides: the saved network
+if it is in range, otherwise the strongest network in `secrets.h`'s
+`WIFI_KNOWN` table that is, otherwise the picker. Trying the saved network
+first and scanning after cost every boot away from it a dead timeout; one
+scan means neither place pays for the other. A known network is only ever
 *written* to a board that has not been given one — otherwise carrying
 someone's device past this desk would quietly replace the network they chose.
 Picking a new network overwrites the saved one; there is no separate forget.
+
+`WIFI_KNOWN` entries are name **prefixes**. That matters for phone hotspots:
+iPhones name theirs with a curly apostrophe (`Merveen’s iPhone`), which a
+typed straight `'` never matches, and `Merveen` matches either. An iPhone
+hotspot also needs **Maximize Compatibility** turned on — the ESP32-S3 is
+2.4 GHz only — and only advertises itself while its Personal Hotspot screen
+is open, so keep that screen up while the device boots.
 
 ## Before the 100-unit build
 
@@ -611,12 +624,12 @@ Picking a new network overwrites the saved one; there is no separate forget.
   validation. Pin AssemblyAI's root CA before these go out on conference wifi.
 - **Wi-Fi provisioning is done** — the Wi-Fi mode scans, lists, takes a
   password on screen and remembers it in NVS, so 100 units ship with
-  `WIFI_SSID_PREFIX` left at its placeholder and ask on first boot. The API
+  `WIFI_KNOWN` left at its placeholder and ask on first boot. The API
   key is still compiled in, and still needs a rebuild per key.
 - The saved password sits in NVS in plain text. That is the recipient's own
   password on the recipient's own device, so the exposure is a board someone
   else picks up — enable flash encryption before these go out.
-- `WIFI_SSID_PREFIX` is matched as a prefix and the strongest match wins, which
+- `WIFI_KNOWN` is matched by prefix and the strongest match wins, which
   is wrong when a venue runs sibling SSIDs: `AssemblyAI` matched
   `AssemblyAI-Guest-SF` (enhanced-open) over `AssemblyAI-Employee-SF` (wpa2/3)
   by 1 dBm. Give it enough of the name to be unambiguous — or leave it blank

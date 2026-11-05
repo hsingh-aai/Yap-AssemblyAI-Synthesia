@@ -132,63 +132,59 @@ bool wifiJoin(const char* ssid, const char* pass, int tries) {
   return true;
 }
 
-// ------------------------------------------------------- compiled-in path
+// ------------------------------------------------------- known networks
 
-// The prefix in secrets.h is the bench shortcut: a board flashed on a desk
-// joins the desk's network without anyone touching the screen. A board that
-// has never been told anything skips straight to the picker.
-static bool haveCompiled() {
-  const char* p = WIFI_SSID_PREFIX;
-  return p[0] && strcmp(p, "your-network") != 0;
+// secrets.h names a few networks the device may join without being asked:
+// the bench, and the hotspot of whoever the unit is shipped to. Matched as
+// prefixes, so "Merveen" finds "Merveen’s iPhone" whatever apostrophe the
+// phone used.
+struct Known { const char* prefix; const char* pass; };
+static const Known kKnown[] = WIFI_KNOWN;
+
+static bool startsWithFold(const String& name, const char* prefix) {
+  String a = name, b = prefix;
+  a.toLowerCase();
+  b.toLowerCase();
+  return a.startsWith(b);
 }
 
-static String findSsid() {
-  String want = String(WIFI_SSID_PREFIX);
-  want.toLowerCase();
-  for (int i = 0; i < g_net_count; ++i) {     // already strongest-first
-    String lower = g_nets[i].ssid;
-    lower.toLowerCase();
-    if (lower.startsWith(want)) return g_nets[i].ssid;
-  }
-  return String();
-}
-
-// Returns whether we got on a network. It never blocks waiting for a human:
-// a first boot in a room with no known network used to sit in a "tap to
-// choose" screen inside setup(), which meant loop() never ran - no heartbeat,
-// no log mode, no way to see what had happened without the screen in front of
-// you. Boot now always finishes, and app.cpp simply opens on the Wi-Fi mode,
-// whose idle face already says "tap to choose a network".
+// One scan, then a decision, so neither place pays the other's timeout: the
+// saved network if it is in range, otherwise the strongest known one that is.
+// The old order - try saved for 8 s, then scan - cost every boot away from
+// the saved network 8 s of nothing.
 bool wifiConnect() {
   faceClear();
   caption("WI-FI");
   title("Wi-Fi");
+  statusLine("scanning", kMuted);
   wifiBegin();
+  wifiScan();
 
   String ssid, pass;
   const bool remembered = wifiLoadCreds(ssid, pass);
   if (remembered) {
-    statusLine(ssid.c_str(), kAccent);
-    if (wifiJoin(ssid.c_str(), pass.c_str(), 32)) return true;   // 8 s
-    logf("[wifi] saved %s: %s", ssid.c_str(), wifiWhy());
+    for (int i = 0; i < g_net_count; ++i) {
+      if (g_nets[i].ssid != ssid) continue;
+      statusLine(ssid.c_str(), kAccent);
+      if (wifiJoin(ssid.c_str(), pass.c_str(), 40)) return true;   // 10 s
+      logf("[wifi] saved %s: %s", ssid.c_str(), wifiWhy());
+      break;
+    }
   }
 
-  if (haveCompiled()) {
-    statusLine("scanning", kMuted);
-    wifiScan();
-    const String found = findSsid();
-    if (found.length()) {
+  for (int i = 0; i < g_net_count; ++i) {             // strongest first
+    for (const Known& k : kKnown) {
+      if (!k.prefix[0] || !strcmp(k.prefix, "your-network")) continue;
+      if (!startsWithFold(g_nets[i].ssid, k.prefix)) continue;
+      const String& found = g_nets[i].ssid;
       statusLine(found.c_str(), kAccent);
-      if (wifiJoin(found.c_str(), WIFI_PASS, 32)) {
-        // Only ever write the bench network into a board that has not been
-        // given one. Otherwise carrying someone's device past this desk
-        // would quietly replace the network they chose.
-        if (!remembered) wifiSaveCreds(found, WIFI_PASS);
+      if (wifiJoin(found.c_str(), k.pass, 40)) {
+        // Only fill an empty slot. A network the owner picked by hand stays
+        // picked, even if a known one happened to be in range today.
+        if (!remembered) wifiSaveCreds(found, k.pass);
         return true;
       }
       logf("[wifi] %s: %s", found.c_str(), wifiWhy());
-    } else {
-      logf("[wifi] nothing like %s", WIFI_SSID_PREFIX);
     }
   }
 
