@@ -41,7 +41,7 @@ static bool keepGoing() {
     drawTail(String("listening..."), kMuted);
     hint("0 turns   tap to finish", kLive);
   }
-  if (poked()) return false;
+  if (homeChord() || poked()) return false;
   if (s_dirty && millis() - s_last_draw > 200) {
     s_dirty = false;
     s_last_draw = millis();
@@ -74,6 +74,7 @@ void notesAct() {
   hint("opening the socket", kMuted);
 
   if (!sttStream(onTurn, keepGoing)) {
+    if (g_go_home) return;
     faceClear();
     caption("NOTETAKER");
     title("No socket", kError);
@@ -81,6 +82,7 @@ void notesAct() {
     delay(2000);
     return;
   }
+  if (g_go_home) return;           // left mid-session: keep nothing
 
   if (s_text.length() < 20) {
     faceClear();

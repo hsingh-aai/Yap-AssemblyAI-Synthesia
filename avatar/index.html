@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <title>Synthesia Interactive Avatar — Quickstart</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif;
+           display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 2rem; }
+    video { max-width: min(90vw, 720px); border-radius: 12px; background: #000; }
+    button { font-size: 1rem; padding: 0.6rem 1.6rem; border-radius: 8px; border: 0; background: #eee; color: #111; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>Synthesia Interactive Avatar</h2>
+  <p id="status">Click Start and allow the microphone.</p>
+  <button id="start">Start</button>
+  <div id="media"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+  <script>
+    const { Room, RoomEvent } = LivekitClient;
+    const status = document.getElementById('status');
+    const button = document.getElementById('start');
+    let room = null;
+
+    function resetUI(message) {
+      status.textContent = message;
+      button.textContent = 'Start';
+      button.disabled = false;
+      document.getElementById('media').replaceChildren();
+      room = null;
+    }
+
+    async function start() {
+      button.disabled = true;
+      status.textContent = 'Connecting…';
+      let avatarJoined = false;
+      let avatarWaitTimer;
+      try {
+        const { url, token } = await (await fetch('/token')).json();
+        room = new Room();
+        // The avatar is a regular LiveKit participant. Attach both its tracks to
+        // ONE element so they share a MediaStream.
+        let media;
+        room.on(RoomEvent.TrackSubscribed, (track) => {
+          if (!media) {
+            media = document.createElement('video');
+            document.getElementById('media').appendChild(media);
+          }
+          track.attach(media);
+          if (track.kind === 'video') {
+            avatarJoined = true;
+            clearTimeout(avatarWaitTimer);
+            status.textContent = 'Connected — say hello!';
+            button.textContent = 'Stop';   // Start becomes Stop once the avatar is live
+            button.disabled = false;
+          }
+        });
+        room.on(RoomEvent.Disconnected, () => {
+          clearTimeout(avatarWaitTimer);
+          resetUI('Disconnected — click Start to talk again.');
+        });
+        await room.connect(url, token);
+        await room.localParticipant.setMicrophoneEnabled(true);
+        if (!avatarJoined) {
+          status.textContent = 'Connected — waiting for the avatar to join';
+          avatarWaitTimer = setTimeout(() => {
+            status.textContent = 'Still waiting for the avatar — check the agent terminal, or Troubleshooting in the README.';
+            button.textContent = 'Stop';   // let the user disconnect and retry
+            button.disabled = false;
+          }, 30000);
+        }
+      } catch (err) {
+        resetUI('Failed to connect: ' + err.message);
+      }
+    }
+
+    async function stop() {
+      button.disabled = true;
+      status.textContent = 'Stopping…';
+      // Disconnecting ends the session cleanly — the agent job closes and the avatar
+      // leaves. (This does NOT stop the local agent/server processes.)
+      if (room) await room.disconnect();   // the Disconnected handler resets the UI
+    }
+
+    button.onclick = () => (room ? stop() : start());
+  </script>
+</body>
+</html>

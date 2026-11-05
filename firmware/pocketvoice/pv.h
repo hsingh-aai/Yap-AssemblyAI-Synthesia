@@ -71,10 +71,46 @@ void drawStatusBody();
 // so an on-screen hint only ever has to name one of them.
 bool poked();
 
+// Both buttons together, from anywhere: abandon whatever is running and go
+// back to the first mode. A mode in the middle of a session can be several
+// screens deep - a network list, then a keyboard - and a stranger at a booth
+// should never need to know the way back out. Every waiting loop checks this,
+// and poked() ignores a button that is half of the chord.
+bool homeChord();
+extern bool g_go_home;
+
+// Where the finger landed. poked() answers "did something happen"; a keyboard
+// and a list need to know where, and must not treat a key press as a poke.
+bool tapped(int* x, int* y);
+
+// Blocking on-screen keyboard. Returns false if the user backed out.
+bool textEntry(const char* cap, const char* prompt, String& out);
+
 // ------------------------------------------------------------------ wifi
 
+// One scan, shared by the boot path and the picker: deduplicated by name and
+// sorted strongest-first, so "the one in this room" is the one at the top.
+static constexpr int kMaxNets = 24;
+struct WifiNet {
+  String  ssid;
+  int32_t rssi;
+  bool    open;
+};
+extern WifiNet g_nets[];
+extern int     g_net_count;
+
 bool wifiUp();
-void wifiConnect();
+void wifiBegin();                  // station mode, no modem sleep, event hook
+int  wifiScan();
+bool wifiJoin(const char* ssid, const char* pass, int tries);
+const char* wifiWhy();             // why the last join ended, in English
+
+// Survives a reboot, so a device is told about a network once.
+void wifiSaveCreds(const String& ssid, const String& pass);
+bool wifiLoadCreds(String& ssid, String& pass);
+
+bool wifiConnect();                // boot: saved, then the secrets.h prefix
+void wifiPick();                   // blocking scan -> choose -> type -> join
 
 // ----------------------------------------------------------------- audio
 
@@ -102,13 +138,14 @@ struct Mode {
   void (*idle)();
   void (*act)();
   void (*tick)();
+  void (*leave)();     // optional: the mode is losing the face
 };
 
 extern const Mode kModes[];
 extern const int  kModeCount;
 
-void blurtIdle();    void blurtAct();  void blurtTick();
-void capIdle();      void capAct();
+void blurtIdle();    void blurtAct();  void blurtTick();  void blurtLeave();
+void wifiIdle();     void wifiAct();
 void jackIdle();     void jackAct();
 void statusIdle();
 void logIdle();
@@ -130,11 +167,28 @@ bool        jsonTrue(const char* buf, size_t len, const char* key);
 bool sttStream(void (*onTurn)(const String& text, bool final),
                bool (*keepGoing)());
 
+// The same socket, opened ahead of time. The cost of starting a session is
+// the TLS handshake, and a mode that knows it is next can pay it while the
+// user is still reading the screen rather than after they tap.
+bool sttOpen();
+void sttPump();
+void sttClose();
+
 // Chat completion through the LLM Gateway. Returns "" on failure and sets
 // the error line.
 String llmAsk(const char* model, const String& prompt, int max_tokens);
 
 void notesIdle();  void notesAct();
+
+// ---------------------------------------------------------------- avatar
+
+// A face whose mouth is driven by the voice rather than by the words. Show
+// it when the agent starts speaking, tell it when the first sample actually
+// sounded, then call animate often; it picks its own frame rate.
+void avatarShow();
+void avatarStart(uint32_t t0);
+void avatarAnimate(const int16_t* pcm, size_t have, uint32_t rate);
+void avatarRest();
 
 // Blocking viewer for a finished result: pages with B, returns on a poke.
 void resultViewer(const char* cap, const String& text);

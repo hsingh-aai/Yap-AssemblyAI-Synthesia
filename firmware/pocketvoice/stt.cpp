@@ -12,7 +12,9 @@ static constexpr char kSttPath[] =
 static constexpr size_t kSttChunk = kSttRate / 20;   // 800 samples
 
 static WebSocketsClient ws;
-static bool g_open = false;
+static bool g_open = false;      // Begin has arrived; audio may flow
+static bool g_opening = false;   // handshake in flight
+static bool g_ended = false;     // server acknowledged our Terminate
 static bool g_trace = false;
 static void (*g_onTurn)(const String&, bool) = nullptr;
 
@@ -20,6 +22,7 @@ static void onEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       g_open = false;
+      g_opening = false;
       break;
     case WStype_TEXT: {
       const char* buf = (const char*)payload;
@@ -28,7 +31,9 @@ static void onEvent(WStype_t type, uint8_t* payload, size_t length) {
       if (g_trace) logf("[stt] rx %s (%u B)", t.c_str(), (unsigned)len);
       if (t == "Begin") {
         g_open = true;
-        logf("[stt] session open");
+        g_opening = false;
+      } else if (t == "Termination") {
+        g_ended = true;
       } else if (t == "Turn") {
         if (g_onTurn) g_onTurn(jsonStr(buf, len, "transcript"),
                                jsonTrue(buf, len, "end_of_turn"));
@@ -45,28 +50,61 @@ static void onEvent(WStype_t type, uint8_t* payload, size_t length) {
   }
 }
 
-bool sttStream(void (*onTurn)(const String&, bool), bool (*keepGoing)()) {
-  if (!wifiUp()) { failf("wi-fi down"); return false; }
+// Start the handshake and return immediately. The expensive part of opening
+// this socket is the TLS handshake, and it does not care whether anyone is
+// looking - so a mode that knows it is about to be used can pay for it while
+// the user is still reading the screen.
+bool sttOpen() {
+  if (g_open || g_opening) return true;
+  if (!wifiUp()) return false;
 
-  g_onTurn = onTurn;
-  g_open = false;
-
+  g_onTurn = nullptr;
+  g_ended = false;
   ws.onEvent(onEvent);
   // No Bearer prefix on this API, unlike the Voice Agent API.
   ws.setExtraHeaders("Authorization: " AAI_API_KEY);
   ws.beginSSL(kSttHost, 443, kSttPath);
+  g_opening = true;
+  return true;
+}
+
+// Call often while idle: this is what drives the handshake to completion.
+void sttPump() {
+  if (g_open || g_opening) ws.loop();
+}
+
+void sttClose() {
+  if (g_open) ws.sendTXT("{\"type\":\"Terminate\"}");
+  ws.disconnect();
+  g_open = false;
+  g_opening = false;
+  g_onTurn = nullptr;
+}
+
+bool sttStream(void (*onTurn)(const String&, bool), bool (*keepGoing)()) {
+  if (!wifiUp()) { failf("wi-fi down"); return false; }
+
+  // Already warm costs nothing here; cold pays the handshake now.
+  const uint32_t t0 = millis();
+  const bool warm = g_open;
+  sttOpen();
+  g_onTurn = onTurn;
+  g_ended = false;
 
   const uint32_t deadline = millis() + 12000;
   while (!g_open && millis() < deadline) {
     ws.loop();
     M5.update();
-    delay(10);
+    if (homeChord()) { sttClose(); return false; }
+    delay(5);
   }
   if (!g_open) {
     failf("no stt socket");
-    ws.disconnect();
+    sttClose();
     return false;
   }
+  logf("[stt] ready in %ums (%s)", (unsigned)(millis() - t0),
+       warm ? "warm" : "cold");
 
   // Prime both mic slots, then ride record()'s own back-pressure: it returns
   // only when a slot frees, which is exactly when the oldest buffer is full.
@@ -95,12 +133,17 @@ bool sttStream(void (*onTurn)(const String&, bool), bool (*keepGoing)()) {
     ws.loop();
   }
 
+  // Wait for the server to acknowledge, not for a fixed 400 ms. The last turn
+  // usually lands in a fraction of that, and the user is standing there.
+  const uint32_t t_end = millis();
   ws.sendTXT("{\"type\":\"Terminate\"}");
-  for (int i = 0; i < 40; ++i) { ws.loop(); delay(10); }
+  while (!g_ended && millis() - t_end < 600) { ws.loop(); delay(5); }
   ws.disconnect();
   g_open = false;
+  g_opening = false;
   g_onTurn = nullptr;
-  logf("[stt] %u frames (%.1fs)", (unsigned)frames, frames * 0.05f);
+  logf("[stt] %u frames (%.1fs) close %ums", (unsigned)frames, frames * 0.05f,
+       (unsigned)(millis() - t_end));
   return true;
 }
 

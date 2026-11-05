@@ -279,15 +279,29 @@ void drawStatusBody() {
 
 // ----------------------------------------------------------------- input
 
-bool poked() {
-  if (M5.BtnA.wasPressed()) return true;
-  if (M5.Touch.isEnabled()) {
-    const auto n = M5.Touch.getCount();
-    for (size_t i = 0; i < n; ++i) {
-      if (M5.Touch.getDetail(i).wasPressed()) return true;
-    }
+bool tapped(int* x, int* y) {
+  if (!M5.Touch.isEnabled()) return false;
+  const auto n = M5.Touch.getCount();
+  for (size_t i = 0; i < n; ++i) {
+    const auto& t = M5.Touch.getDetail(i);
+    if (t.wasPressed()) { *x = t.x; *y = t.y; return true; }
   }
   return false;
+}
+
+bool g_go_home = false;
+
+bool homeChord() {
+  if (g_go_home) return true;
+  if (M5.BtnA.isPressed() && M5.BtnB.isPressed()) g_go_home = true;
+  return g_go_home;
+}
+
+bool poked() {
+  if (homeChord()) return false;
+  if (M5.BtnA.wasPressed()) return true;
+  int x, y;
+  return tapped(&x, &y);
 }
 
 // ---------------------------------------------------------------- results
@@ -316,6 +330,7 @@ void resultViewer(const char* cap, const String& text) {
       hint(pages > 1 ? "B: next page   tap: again" : "tap to go again");
       redraw = false;
     }
+    if (homeChord()) return;
     if (M5.BtnB.wasPressed()) {
       if (pages > 1) { page = (page + 1) % pages; redraw = true; }
       else return;

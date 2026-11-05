@@ -10,12 +10,12 @@
 #include "pv.h"
 
 const Mode kModes[] = {
-  {"Blurt",     "say it, send it to the Mac", blurtIdle, blurtAct,  blurtTick},
-  {"Captions",  "words as you say them",     capIdle,    capAct,    nullptr},
-  {"Notetaker", "listen, then summarise",    notesIdle,  notesAct,  nullptr},
-  {"Jack",      "a voice agent to talk to",  jackIdle,   jackAct,   nullptr},
-  {"Status",    "wi-fi, memory, last error", statusIdle, nullptr,   nullptr},
-  {"Log",       "what just happened",        logIdle,    nullptr,   nullptr},
+  {"Blurt",     "say it, send it to the Mac", blurtIdle, blurtAct, blurtTick, blurtLeave},
+  {"Notetaker", "listen, then summarise",    notesIdle,  notesAct, nullptr,   nullptr},
+  {"Jack",      "a voice agent to talk to",  jackIdle,   jackAct,  nullptr,   nullptr},
+  {"Wi-Fi",     "pick a network, type a key", wifiIdle,  wifiAct,  nullptr,   nullptr},
+  {"Status",    "wi-fi, memory, last error", statusIdle, nullptr,  nullptr,   nullptr},
+  {"Log",       "what just happened",        logIdle,    nullptr,  nullptr,   nullptr},
 };
 const int kModeCount = (int)(sizeof(kModes) / sizeof(kModes[0]));
 
@@ -44,6 +44,19 @@ static void showMode() {
   modeDots();
 }
 
+// Put down whatever the current mode holds and open the first one. Waits for
+// both buttons to come up first; otherwise the chord is still held when
+// loop() runs again and it fires a second time.
+static void goHome() {
+  if (kModes[g_mode].leave) kModes[g_mode].leave();
+  while (M5.BtnA.isPressed() || M5.BtnB.isPressed()) { M5.update(); delay(10); }
+  M5.update();
+  g_go_home = false;
+  g_mode = 0;
+  logf("[home]");
+  showMode();
+}
+
 void setup() {
   auto cfg = M5.config();
   cfg.internal_mic = true;
@@ -69,7 +82,13 @@ void setup() {
        (unsigned)(ESP.getFreePsram() / 1024));
 
   M5.Mic.begin();
-  wifiConnect();
+  if (!wifiConnect()) {
+    // Nothing to transcribe with. Start on the one mode that can fix that
+    // rather than on a mode that would only fail.
+    for (int i = 0; i < kModeCount; ++i) {
+      if (!strcmp(kModes[i].name, "Wi-Fi")) { g_mode = i; break; }
+    }
+  }
 #if PV_SELFTEST & 1
   jackSelfTest();
 #endif
@@ -82,7 +101,12 @@ void setup() {
 void loop() {
   M5.update();
 
+  if (homeChord()) { goHome(); return; }
+
   if (M5.BtnB.wasPressed()) {
+    // Let the mode put down whatever it was holding - Blurt keeps a warmed
+    // socket open while it sits idle, and nobody else should inherit it.
+    if (kModes[g_mode].leave) kModes[g_mode].leave();
     g_mode = (g_mode + 1) % kModeCount;
     showMode();
     return;
@@ -91,6 +115,7 @@ void loop() {
   if (poked()) {
     if (kModes[g_mode].act) {
       kModes[g_mode].act();      // owns the face until the user is done
+      if (g_go_home) { goHome(); return; }
       showMode();
     } else {
       showMode();                // Status and Log just refresh

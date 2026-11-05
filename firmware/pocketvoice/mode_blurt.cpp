@@ -13,11 +13,20 @@
 // you are still talking, so the tap that ends the sentence also finishes the
 // job - and the 12-second recording cap goes with it, since nothing is being
 // held in memory any more.
+//
+// What streaming did not delete is the cost of *starting*: a TLS handshake to
+// the streaming endpoint, paid at the moment of the tap, while the user
+// stands there having already begun talking. So Blurt opens the socket when
+// you arrive in the mode rather than when you tap, pumps the handshake along
+// in its idle tick, and hands it back when you walk away. The tap then costs
+// nothing, and the first word is already on the wire.
 
 #include "pv.h"
 
 static constexpr size_t kChunk = 512;   // idle mic meter only
 
+static uint32_t s_t0;        // the tap, for the one latency that matters
+static bool     s_heard;     // have any words landed this session
 static String   s_text;      // turns the server has closed
 static String   s_partial;   // the one still being spoken
 static bool     s_dirty;
@@ -32,6 +41,10 @@ static String shown() {
 }
 
 static void onTurn(const String& text, bool final) {
+  if (!s_heard && text.length()) {
+    s_heard = true;
+    logf("[blurt] first words %ums after the tap", (unsigned)(millis() - s_t0));
+  }
   if (final) {
     if (text.length()) {
       if (s_text.length()) s_text += " ";
@@ -60,7 +73,7 @@ static bool keepGoing() {
     s_live = true;
     paint();
   }
-  if (poked()) return false;
+  if (homeChord() || poked()) return false;
   if (s_dirty && millis() - s_last_draw > 160) {
     s_dirty = false;
     s_last_draw = millis();
@@ -74,9 +87,14 @@ void blurtIdle() {
   caption("BLURT");
   title("Blurt");
   hint("tap, talk, tap again");
+  sttOpen();                  // pay for the handshake now, not on the tap
 }
 
+void blurtLeave() { sttClose(); }
+
 void blurtTick() {
+  sttPump();                  // what actually drives the handshake home
+
   // Proves the mic on the face: if this bar never moves, the ES8311 side is
   // the problem and not the network.
   static int16_t probe[kChunk];
@@ -85,6 +103,8 @@ void blurtTick() {
 }
 
 void blurtAct() {
+  s_t0 = millis();
+  s_heard = false;
   s_text = "";
   s_partial = "";
   s_dirty = false;
@@ -97,6 +117,7 @@ void blurtAct() {
   hint("opening the socket", kMuted);
 
   if (!sttStream(onTurn, keepGoing)) {
+    if (g_go_home) return;
     faceClear();
     caption("BLURT");
     title("No socket", kError);
@@ -104,6 +125,7 @@ void blurtAct() {
     delay(2000);
     return;
   }
+  if (g_go_home) return;           // left mid-session: keep nothing
 
   if (!s_text.length()) {
     faceClear();

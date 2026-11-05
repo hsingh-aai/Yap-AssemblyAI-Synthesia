@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Turn an avatar render into mouth sprites the device can blit.
+
+    ./tools/make_avatar.py --video jack.mp4 --mouth 90,185,120,70
+
+Jack's replies are written by an LLM a second before he says them, so no
+pre-rendered clip can ever be saying his words. What a pre-rendered clip
+*can* give us is a face and a set of mouth shapes; the device then picks one
+per 50 ms from the envelope of the audio that is sounding right now. The
+mouth never forms real words, but it moves in time with the voice, which is
+the part people actually notice.
+
+So this does not keep the video. It keeps one base portrait plus N mouth
+crops chosen to span closed-to-open, and emits them as C arrays:
+
+  * the base face as JPEG   - decoded once, when the reply starts
+  * each mouth as RGB565    - blitted in a millisecond, no decode at all
+
+Openness is scored without numpy or Pillow: ffmpeg hands us the mouth box as
+raw grayscale and an open mouth is darker than a closed one, because the
+oral cavity is a hole. Mean luma over a few hundred small frames is cheap in
+plain Python.
+"""
+import argparse, os, shutil, subprocess, sys, tempfile
+
+def ffmpeg(*args):
+    r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", *args],
+                       capture_output=True)
+    if r.returncode:
+        sys.exit(f"ffmpeg failed: {r.stderr.decode()[:400]}")
+    return r.stdout
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", required=True, help="the avatar render (mp4)")
+    ap.add_argument("--size", type=int, default=300, help="face square, px")
+    ap.add_argument("--mouth", required=True,
+                    help="mouth box within the face square: x,y,w,h")
+    ap.add_argument("--levels", type=int, default=6)
+    ap.add_argument("--open-is", choices=("dark", "bright"), default="dark",
+                    dest="open_is",
+                    help="a human mouth is darker open (the default); a lit "
+                         "jack-o-lantern is brighter")
+    ap.add_argument("--fps", type=int, default=10, help="sampling rate only")
+    ap.add_argument("--out", default="firmware/pocketvoice")
+    a = ap.parse_args()
+
+    mx, my, mw, mh = (int(v) for v in a.mouth.split(","))
+    if mw % 2 or mh % 2:
+        sys.exit("mouth width and height must be even")
+    S = a.size
+    tmp = tempfile.mkdtemp(prefix="avatar-")
+    try:
+        # Square the face once, so every later crop is in the same frame.
+        square = os.path.join(tmp, "sq.mp4")
+        ffmpeg("-i", a.video, "-vf",
+               f"crop='min(iw,ih)':'min(iw,ih)',scale={S}:{S},fps={a.fps}",
+               "-an", square)
+
+        # Score every frame by how dark its mouth box is.
+        gray = ffmpeg("-i", square, "-vf", f"crop={mw}:{mh}:{mx}:{my},format=gray",
+                      "-f", "rawvideo", "-")
+        n = mw * mh
+        count = len(gray) // n
+        if count < a.levels:
+            sys.exit(f"only {count} frames; need at least {a.levels}")
+        scores = []
+        for i in range(count):
+            box = gray[i * n:(i + 1) * n]
+            scores.append((sum(box) / n, i))
+        scores.sort()
+
+        # Spread the picks across the observed range rather than taking the
+        # N darkest: the point is a ladder from shut to wide, not N frames of
+        # the same yawn.
+        step = (len(scores) - 1) / (a.levels - 1)
+        picks = [scores[round(k * step)] for k in range(a.levels)]
+        if a.open_is == "dark":
+            picks.reverse()                  # brightest first, i.e. shut first
+        print(f"# {count} frames; luma {picks[0][0]:.0f} (shut) "
+              f"-> {picks[-1][0]:.0f} (open)")
+
+        # The base face comes from the shut frame, so the resting portrait and
+        # the mouth sprites agree about everything except the mouth.
+        base_idx = picks[0][1]
+        base_png = os.path.join(tmp, "base.png")
+        ffmpeg("-i", square, "-vf", f"select='eq(n\\,{base_idx})'",
+               "-vframes", "1", base_png)
+        base_jpg = os.path.join(tmp, "base.jpg")
+        ffmpeg("-i", base_png, "-q:v", "6", base_jpg)
+        base = open(base_jpg, "rb").read()
+
+        rgb = ffmpeg("-i", square, "-vf",
+                     f"crop={mw}:{mh}:{mx}:{my},format=rgb565le",
+                     "-f", "rawvideo", "-")
+        per = mw * mh * 2
+        mouths = [rgb[i * per:(i + 1) * per] for _, i in picks]
+        write_header(a.out, S, mx, my, mw, mh, base, mouths)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def write_header(out, size, mx, my, mw, mh, base, mouths):
+    """Emit avatar.h (shape) and avatar_data.cpp (bytes)."""
+    def c_bytes(b, per_line=16):
+        return "\n".join("  " + " ".join(f"0x{v:02x}," for v in b[i:i + per_line])
+                         for i in range(0, len(b), per_line))
+
+    with open(os.path.join(out, "avatar.h"), "w") as f:
+        f.write(f"""// Generated by tools/make_avatar.py - do not edit by hand.
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+static constexpr int kAvatarSize   = {size};
+static constexpr int kMouthLevels  = {len(mouths)};
+static constexpr int kMouthX       = {mx};
+static constexpr int kMouthY       = {my};
+static constexpr int kMouthW       = {mw};
+static constexpr int kMouthH       = {mh};
+
+extern const uint8_t  kAvatarBase[];
+extern const size_t   kAvatarBaseLen;
+extern const uint16_t kMouthPix[kMouthLevels][kMouthW * kMouthH];
+""")
+
+    with open(os.path.join(out, "avatar_data.cpp"), "w") as f:
+        f.write('// Generated by tools/make_avatar.py - do not edit by hand.\n'
+                '#include "avatar.h"\n\n')
+        f.write(f"const size_t kAvatarBaseLen = {len(base)};\n")
+        f.write("const uint8_t kAvatarBase[] = {\n" + c_bytes(base) + "\n};\n\n")
+        f.write(f"const uint16_t kMouthPix[{len(mouths)}][{mw * mh}] = {{\n")
+        for m in mouths:
+            words = [m[i] | (m[i + 1] << 8) for i in range(0, len(m), 2)]
+            f.write("{\n" + "\n".join(
+                "  " + " ".join(f"0x{w:04x}," for w in words[i:i + 12])
+                for i in range(0, len(words), 12)) + "\n},\n")
+        f.write("};\n")
+    kb = (len(base) + sum(len(m) for m in mouths)) / 1024
+    print(f"# wrote avatar.h + avatar_data.cpp  ({kb:.0f} KB of flash)")
+
+if __name__ == "__main__":
+    main()

@@ -21,19 +21,27 @@ the screen — or the yellow button — does whatever the face says. There is no
 menu to get lost in, which matters for a device handed to a hundred strangers
 at a party. Dots along the bottom arc show where you are.
 
+**Press A and B together, from anywhere, to go home.** A mode can be several
+screens deep (a network list, then a keyboard) and nobody at a booth should
+need to know the way back out. Every waiting loop checks for the chord,
+`poked()` ignores a button that is half of it, and a session abandoned this
+way is discarded rather than relayed or summarised.
+
 | Mode | What it does | AssemblyAI product |
 |---|---|---|
 | **Blurt** | Tap, talk, tap. The text is already there, and goes up the cable to the Mac. | Realtime STT |
-| **Captions** | Live words as you speak them, partials grey, finals white. | Realtime STT |
 | **Notetaker** | Listens as long as you like, then writes a summary and action items. | Realtime STT + LLM Gateway |
 | **Jack** | A voice agent you can hold a conversation with. Tap to interrupt him. | Voice Agent API |
+| **Wi-Fi** | Scan, pick a network from the list, type the password on screen. | — |
 | **Status** | Wi-Fi, IP, RSSI, touch, memory, last error. | — |
 | **Log** | The last eleven log lines, same as the serial relay. | — |
 
 Source layout: `pv.h` declares everything shared; `ui.cpp` has the round-face
-drawing, the chord text layout and the log ring; `net.cpp` is Wi-Fi; `stt.cpp`
-is the realtime socket that Blurt, Captions and Notetaker share; `llm.cpp` is the
-gateway call; each `mode_*.cpp` is one mode and `app.cpp` is the carousel.
+drawing, the chord text layout and the log ring; `net.cpp` is Wi-Fi — one
+scan, one join, and the two strings in NVS that survive a reboot;
+`keyboard.cpp` is the on-screen keyboard; `stt.cpp` is the realtime socket
+that Blurt and Notetaker share; `llm.cpp` is the gateway call; each
+`mode_*.cpp` is one mode and `app.cpp` is the carousel.
 A mode owns the whole face while it runs.
 
 ### How it got here
@@ -150,7 +158,7 @@ permission, so it looks like a bug in the relay.
 
 Finished transcripts go out as `[say] <text>`, separate from `logf`, which is
 bounded by the on-screen log's width and by its own 192-byte line. Blurt,
-Captions and Notetaker all emit it.
+Blurt and Notetaker both emit it.
 
 The escaping is deliberately **the same convention Blurt's listener reads**:
 `\n` is a newline, `\\` is a backslash, and the line break is the frame. One
@@ -361,7 +369,7 @@ reply shorter than that).
 
 `sttStream()` only starts calling `keepGoing()` once the socket is open, which
 makes the first call the exact moment the face can stop saying "Connecting".
-Captions and Notetaker both used to repaint only when a *turn* arrived - so a
+Blurt and Notetaker both used to repaint only when a *turn* arrived - so a
 perfectly healthy socket sat on the connecting screen until someone had
 spoken a whole sentence, and reported as "still connecting". The socket was
 never the problem; only two of the three states were on screen.
@@ -453,14 +461,164 @@ dependency-free and `check.sh` guards that.
 Do not add a `blurt://insert?text=…` URL scheme. macOS keeps records of URLs,
 and dictated speech can be private.
 
+## Two avatars, because the device can only have one of them
+
+Synthesia's **interactive** avatar lip-syncs live speech properly, and it is
+not available to this board. It joins a LiveKit room as a participant and the
+frontend is an ordinary LiveKit client, so it needs a WebRTC video
+subscriber; LiveKit's ESP32 SDK is audio-only, ESP-IDF-only and a developer
+preview, and decoding live video onto a 466 px panel is out regardless. So it
+runs on a booth screen next to the device, in `avatar/` — the same Jack,
+reading his persona from the same stored AssemblyAI agent so the two cannot
+drift apart. AssemblyAI does the transcription there too, with its own
+endpointing model deciding when a turn ends.
+
+What follows is the avatar the device itself can have.
+
+## An avatar that cannot lip-sync, and why it still works
+
+Phase 5 wanted a face for the agent. The obvious plan — render the avatar
+saying the reply — does not survive contact with the clock: Jack's replies
+are written by an LLM about a second before he says them, and a Synthesia
+render takes minutes. Nothing pre-rendered can ever be saying his words.
+
+What a pre-rendered clip *can* give is a face and a ladder of mouth shapes.
+The device then picks one twenty times a second from the envelope of the
+audio that is sounding right now. The mouth never forms a real word, and it
+turns out not to need to: what reads as speech is the mouth moving when the
+voice moves and shutting in the gaps between words. Lip-sync is a detail
+people notice only once the timing is already right.
+
+Two decisions carry it:
+
+* **The base face is a JPEG decoded once; each mouth is raw RGB565 blitted
+  straight to the panel.** Re-decoding a 300 px JPEG every frame costs more
+  than the whole frame budget. Pushing a 128×76 sprite costs about a
+  millisecond, so 20 fps is free and the frame rate is set by taste.
+* **The mouth is clocked from playback, not from the queue.** `pumpSpeaker()`
+  runs up to 200 ms ahead of the speaker, so driving the mouth from the block
+  being queued would put it 200 ms early — worse than no mouth at all. The
+  whole reply is already in `g_reply`, so the sample sounding *now* is just
+  `(millis() - t0) * rate / 1000`, and the envelope is read around that.
+
+The envelope follower has a fast attack and a slow release. Tracking the
+samples exactly makes the mouth flicker; snapping open and easing shut reads
+as speech. The ladder thresholds are hand-set rather than linear because
+`loudenUp()` has already soft-limited the audio, so the loud end is squeezed
+into very little range and only the word/gap structure is left to work with.
+
+`tools/make_avatar.py` turns any render into the two generated files. It
+scores every frame by how dark the mouth box is — an open mouth is a hole —
+and spreads its picks across the observed range rather than taking the N
+darkest, which would give N frames of the same yawn. No numpy, no Pillow:
+ffmpeg hands over the mouth box as raw grayscale and a few hundred small
+frames is nothing in plain Python. A lit jack-o'-lantern inverts the
+assumption, hence `--open-is bright`.
+
+```
+./tools/pumpkin.py --out /tmp/pumpkin.mp4
+./tools/make_avatar.py --video /tmp/pumpkin.mp4 \
+    --mouth 86,176,128,76 --open-is bright
+```
+
+`tools/pumpkin.py` draws the stand-in: a jack-o'-lantern opening and shutting
+its mouth, deliberately fed through the same pipeline so the day a real
+render arrives nothing changes but the filename. It is also reasonable to
+ship — Jack is a three-hundred-year-old pumpkin.
+
+The face costs 123 KB of flash, taking the build from 43% to 47%.
+
+## Blurt's slowness was never the transcription
+
+Moving Blurt off the pre-recorded API deleted the wait for *words*, but it
+left the wait for a *session*. Opening the realtime socket means a TLS
+handshake to `streaming.assemblyai.com`, and that was being paid at the
+moment of the tap — while the user, having already tapped, had already
+started talking. The first second of the sentence went into a socket that did
+not exist yet.
+
+The handshake does not care whether anyone is looking at it. So Blurt now
+opens the socket when you *arrive* in the mode, pumps it along in the same
+idle tick that drives the mic meter, and hands it back when you walk away
+(`Mode` gained a `leave()` hook for exactly this). By the time a finger comes
+down the session is open, and the tap costs nothing. The log says which it
+got:
+
+```
+[stt] ready in 12ms (warm)      <- handshake already paid
+[stt] ready in 1180ms (cold)    <- socket dropped while idle, paid on the tap
+```
+
+The cold path is still there and still correct — a session the server closed
+while you were reading reopens on the tap — so the warm path is an
+optimisation, not a dependency.
+
+**The other fixed cost was at the end.** Closing used to be a flat
+`for (i < 40) delay(10)` — 400 ms of standing still to make sure the last
+turn had landed. The server sends a `Termination` message when it is done,
+so the drain now ends on that message and keeps the 600 ms only as a cap.
+
+## Choosing a network on a device with no keyboard
+
+A board on a bench joins the network named in `secrets.h`. A board in
+someone's hand has never heard of their network, and there is no way to tell
+it: no serial console, no companion app, and no second network to provision
+over. So it has to ask.
+
+**The keyboard is the hard part, and the round screen is why.** A circle is
+widest across its equator, which is exactly where a keyboard wants to be.
+Five rows centred on the middle each get about 400 px of chord, so ten
+columns land on 36–44 px keys — roughly what a phone gives you. Stack those
+same rows downward instead and the bottom one has 290 px to share, which puts
+the keys at 29 px: the difference between typing and poking. So every row
+sizes itself to *its own* chord rather than to a shared grid, and the
+geometry stops being in the way.
+
+| Row | dy from centre | Chord | Keys | Width each |
+|---|---|---|---|---|
+| `1234567890` | −80 | 403 px | 10 | 36 px |
+| `qwertyuiop` | −40 | 427 px | 10 | 39 px |
+| `asdfghjkl` | 0 | 434 px | 9 | 44 px |
+| shift `zxcvbnm` del | +40 | 427 px | 9 | 43 px |
+| `?123` space done | +80 | 403 px | 5 | 76 px |
+
+Three layers over those rows — lower, upper, symbols — cover every character
+a WPA2 passphrase can hold. The password is shown in the clear: the only
+person who can read this screen is the person holding the device, and a
+password you cannot check is a password you retype three times.
+
+**The scan is deduplicated.** A mesh answers once per node it has, so a raw
+scan list is three screens of the same house. Keeping the loudest copy of
+each name and sorting strongest-first also makes "the closest match wins"
+fall out of the prefix search the bench path uses, which deleted a loop.
+
+**A failed join says why.** `WiFi.status()` cannot tell a wrong password from
+an out-of-range AP — both arrive as `WL_DISCONNECTED` — but the
+`ARDUINO_EVENT_WIFI_STA_DISCONNECTED` event carries a reason code, and
+`WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT` versus `WIFI_REASON_NO_AP_FOUND` is the
+difference between a user retyping and a user giving up.
+
+The chosen network goes into NVS under the `pocketvoice` namespace, so a
+device is told once. Boot order is: saved credentials, then the `secrets.h`
+prefix if it is still set, then the picker. The bench network is only ever
+*written* to a board that has not been given one — otherwise carrying
+someone's device past this desk would quietly replace the network they chose.
+Picking a new network overwrites the saved one; there is no separate forget.
+
 ## Before the 100-unit build
 
 - `p2_blurt` calls `WiFiClientSecure::setInsecure()` — no certificate
   validation. Pin AssemblyAI's root CA before these go out on conference wifi.
-- Credentials are compiled in. 100 devices on event wifi need provisioning
-  (SoftAP setup, or a captive portal) rather than a rebuild per unit.
+- **Wi-Fi provisioning is done** — the Wi-Fi mode scans, lists, takes a
+  password on screen and remembers it in NVS, so 100 units ship with
+  `WIFI_SSID_PREFIX` left at its placeholder and ask on first boot. The API
+  key is still compiled in, and still needs a rebuild per key.
+- The saved password sits in NVS in plain text. That is the recipient's own
+  password on the recipient's own device, so the exposure is a board someone
+  else picks up — enable flash encryption before these go out.
 - `WIFI_SSID_PREFIX` is matched as a prefix and the strongest match wins, which
   is wrong when a venue runs sibling SSIDs: `AssemblyAI` matched
   `AssemblyAI-Guest-SF` (enhanced-open) over `AssemblyAI-Employee-SF` (wpa2/3)
-  by 1 dBm. Give it enough of the name to be unambiguous.
+  by 1 dBm. Give it enough of the name to be unambiguous — or leave it blank
+  and let the picker ask, which is now the better answer for a venue.
 - Per the deck: ~20 units flashed a day, ~5 working days for 100.

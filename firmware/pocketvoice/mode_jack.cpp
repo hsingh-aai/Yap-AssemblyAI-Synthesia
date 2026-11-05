@@ -93,6 +93,11 @@ static void startSpeaking() {
   s_reply_done = false;
   s_agent = "";
   s_phase = SPEAKING;
+  // The face takes the whole screen while he talks. His words are audible
+  // and in the log; the thing worth looking at is him.
+  faceClear();
+  caption("JACK");
+  avatarShow();
   s_dirty = true;
 }
 
@@ -100,8 +105,11 @@ static void startListening() {
   M5.Speaker.stop();
   M5.Speaker.end();
   M5.Mic.begin();
+  avatarRest();
   s_user = "";
   s_phase = LISTENING;
+  faceClear();                     // wipe the face, which overruns the text band
+  caption("JACK");
   s_dirty = true;
 }
 
@@ -181,8 +189,7 @@ static void onEvent(WStype_t type, uint8_t* payload, size_t length) {
 
 static void drawBody() {
   if (s_phase == SPEAKING) {
-    drawTail(s_agent.length() ? s_agent : String("..."), kPaper);
-    hint("tap to interrupt", kLive);
+    hint("tap to interrupt", kLive);     // the avatar owns the rest
   } else {
     drawTail(s_user.length() ? s_user : String("listening..."),
              s_user.length() ? kPaper : kMuted);
@@ -205,6 +212,7 @@ static bool pumpSpeaker() {
                             false, 1, kSpkCh, false)) {
       return false;
     }
+    if (!s_played) avatarStart(millis());
     s_played += kPlayBlock;
   }
   if (s_reply_done && s_played < have && M5.Speaker.isPlaying(kSpkCh) < 2) {
@@ -260,7 +268,7 @@ void jackAct() {
   while (!s_ready && millis() < deadline) {
     ws.loop();
     M5.update();
-    if (poked()) { ws.disconnect(); return; }
+    if (homeChord() || poked()) { ws.disconnect(); return; }
     delay(10);
   }
   if (!s_ready) {
@@ -279,6 +287,8 @@ void jackAct() {
   while (true) {
     ws.loop();
     M5.update();
+
+    if (homeChord()) break;           // the cleanup below still runs
 
     if (poked()) {
       if (s_phase == SPEAKING) {
@@ -300,6 +310,7 @@ void jackAct() {
     }
 
     if (s_phase == SPEAKING) {
+      avatarAnimate(g_reply, s_reply_len, kAgentRate);
       const size_t c = M5.Speaker.getPlayingChannels();
       if (c > s_max_chans) s_max_chans = c;
       if (pumpSpeaker() && !M5.Speaker.isPlaying()) {

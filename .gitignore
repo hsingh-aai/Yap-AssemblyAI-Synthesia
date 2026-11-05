@@ -1,2 +1,6 @@
 firmware/*/secrets.h
 build/
+.env
+.env.*
+.venv/
+!.env.example
