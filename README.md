@@ -475,61 +475,52 @@ endpointing model deciding when a turn ends.
 
 What follows is the avatar the device itself can have.
 
-## An avatar that cannot lip-sync, and why it still works
+## Jack's face on the device: real video, not mouth swaps
 
-Phase 5 wanted a face for the agent. The obvious plan — render the avatar
-saying the reply — does not survive contact with the clock: Jack's replies
-are written by an LLM about a second before he says them, and a Synthesia
-render takes minutes. Nothing pre-rendered can ever be saying his words.
+Jack's replies are written by an LLM a second before he says them, so no
+pre-rendered face can be saying his words. The device's face is cut from a
+recording of Synthesia's live avatar (`avatar/capture_avatar.py` joins a room
+as a silent participant and records the avatar's video track).
 
-What a pre-rendered clip *can* give is a face and a ladder of mouth shapes.
-The device then picks one twenty times a second from the envelope of the
-audio that is sounding right now. The mouth never forms a real word, and it
-turns out not to need to: what reads as speech is the mouth moving when the
-voice moves and shutting in the gaps between words. Lip-sync is a detail
-people notice only once the timing is already right.
+**Mouth swapping looked glitchy on a human face, and no tuning fixed it.** The
+first approach picked a ladder of cut-out mouths and chose one per frame by
+loudness — fine on a drawn jack-o'-lantern, wrong on a person. The driver was
+tuned properly (`tools/mouthsearch.py` replays the device's exact logic on a
+real Jack reply across 1,296 configurations: RMS over 20 ms, 30 fps, ~77 ms
+smoothing, at most 2 of 8 shapes a frame — tracking went from r = 0.64 to
+0.82), and the ladder was fixed so the shapes ran shut-to-wide in order. It
+still shimmered, and `tools/ladderpop.py` showed why: when a person opens
+their mouth their cheeks, moustache and chin move too, so every cut-out
+brought a different moment's face with it — about 5 levels of change around
+the mouth per step. Lining each frame up with the resting face didn't help,
+because the face was deforming, not moving.
 
-Two decisions carry it:
+**So the device plays real video.** `tools/make_talkloop.py` keeps ~1.6 s of
+*consecutive* frames of the lower face (cheeks, moustache, jaw — everything
+that moves together), from the stretch of the recording with the most mouth
+movement and the least head movement, starting on a shut mouth. While Jack's
+voice is above the gate the device plays it forwards then backwards, so there
+is never a seam in time; when he pauses for more than 180 ms it plays on to a
+shut frame and holds. The lips don't form his words — they move the way a
+person's do, and start and stop with the voice, read from the sample actually
+sounding rather than the one being queued.
 
-* **Face and mouths are raw RGB565, pushed straight to the panel.** The
-  face started as a JPEG and drew *nothing* on hardware: ffmpeg had encoded
-  it with 1x2 sampling on all three components, which the board's decoder
-  doesn't support, and it fails silently. Raw pixels cost more flash and
-  can't fail that way. They are also stored byte-swapped — M5GFX reads a
-  `uint16_t` image as big-endian RGB565, and native words turned the
-  pumpkin's orange into magenta and blue on the first run.
-* **The mouth is clocked from playback, not from the queue.** `pumpSpeaker()`
-  runs up to 200 ms ahead of the speaker, so driving the mouth from the block
-  being queued would put it 200 ms early — worse than no mouth at all. The
-  whole reply is already in `g_reply`, so the sample sounding *now* is just
-  `(millis() - t0) * rate / 1000`, and the envelope is read around that.
+| | |
+|---|---|
+| loop | 40 frames × 100×76 px, 25 fps, ping-pong |
+| face | the loop's first frame, 300×300, pushed once per reply |
+| storage | raw RGB565, byte-swapped for the panel — 770 KB, build at 68% |
 
-The envelope follower has a fast attack and a slow release. Tracking the
-samples exactly makes the mouth flicker; snapping open and easing shut reads
-as speech. The ladder thresholds are hand-set rather than linear because
-`loudenUp()` has already soft-limited the audio, so the loud end is squeezed
-into very little range and only the word/gap structure is left to work with.
+**Two hardware lessons from the first run.** The face started as a JPEG and
+drew *nothing*: ffmpeg had encoded it with 1x2 chroma sampling, which the
+board's decoder doesn't support, and it fails silently. And M5GFX reads a
+`uint16_t` image as big-endian RGB565, so native words turned orange into
+magenta and blue. Everything is now raw pixels in panel byte order.
 
-`tools/make_avatar.py` turns any render into the two generated files. It
-scores every frame by how dark the mouth box is — an open mouth is a hole —
-and spreads its picks across the observed range rather than taking the N
-darkest, which would give N frames of the same yawn. No numpy, no Pillow:
-ffmpeg hands over the mouth box as raw grayscale and a few hundred small
-frames is nothing in plain Python. A lit jack-o'-lantern inverts the
-assumption, hence `--open-is bright`.
-
-```
-./tools/pumpkin.py --out /tmp/pumpkin.mp4
-./tools/make_avatar.py --video /tmp/pumpkin.mp4 \
-    --mouth 86,176,128,76 --open-is bright
-```
-
-`tools/pumpkin.py` draws the stand-in: a jack-o'-lantern opening and shutting
-its mouth, deliberately fed through the same pipeline so the day a real
-render arrives nothing changes but the filename. It is also reasonable to
-ship — Jack is a three-hundred-year-old pumpkin.
-
-The face costs 290 KB of flash, taking the build from 43% to 52%.
+`tools/make_avatar.py` (the mouth-ladder generator) and `tools/pumpkin.py`
+are kept for the record, but their output is the older mouth-ladder format,
+which the current `avatar.cpp` no longer reads — regenerate with
+`make_talkloop.py` instead.
 
 ## Blurt's slowness was never the transcription
 

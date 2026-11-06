@@ -49,6 +49,10 @@ def main():
                     help="a human mouth is darker open (the default); a lit "
                          "jack-o-lantern is brighter")
     ap.add_argument("--fps", type=int, default=10, help="sampling rate only")
+    ap.add_argument("--gap-luma", type=int, default=60, dest="gap_luma",
+                    help="darker than this counts as the open mouth's gap")
+    ap.add_argument("--align", type=int, default=12,
+                    help="largest head shift, in px, to correct for")
     ap.add_argument("--feather", type=int, default=6,
                     help="px of each mouth edge blended into the face beneath")
     ap.add_argument("--out", default="firmware/pocketvoice")
@@ -67,61 +71,94 @@ def main():
                "-an", square)
 
         # Score every frame by how dark its mouth box is.
-        gray = ffmpeg("-i", square, "-vf", f"crop={mw}:{mh}:{mx}:{my},format=gray",
-                      "-f", "rawvideo", "-")
-        n = mw * mh
-        count = len(gray) // n
+        # Whole frames, once, as grayscale (to measure) and as RGB565 (to keep).
+        G = ffmpeg("-i", square, "-vf", "format=gray", "-f", "rawvideo", "-")
+        C = ffmpeg("-i", square, "-vf", "format=rgb565le", "-f", "rawvideo", "-")
+        count = len(G) // (S * S)
         if count < a.levels:
             sys.exit(f"only {count} frames; need at least {a.levels}")
-        scores = []
-        for i in range(count):
-            box = gray[i * n:(i + 1) * n]
-            scores.append((sum(box) / n, i))
-        scores.sort()
-        if a.open_is == "dark":
-            scores.reverse()                 # brightest first, i.e. shut first
-        print(f"# {count} frames; luma {scores[0][0]:.0f} (shut) "
-              f"-> {scores[-1][0]:.0f} (open)")
 
-        # The face is the most-shut frame, so the resting portrait and the
-        # mouths agree about everything except the mouth.
-        base_idx = scores[0][1]
-        base_box = gray[base_idx * n:(base_idx + 1) * n]
+        # Where the mouth is, and the inside of it.
+        inner_xy = [(x, y) for y in range(int(mh * 0.15), int(mh * 0.85))
+                    for x in range(int(mw * 0.2), int(mw * 0.8))]
+        def gap_area(f, dx=0, dy=0):
+            o = f * S * S
+            if a.open_is == "dark":
+                return sum(1 for x, y in inner_xy
+                           if G[o + (my + dy + y) * S + mx + dx + x] < a.gap_luma)
+            return sum(1 for x, y in inner_xy
+                       if G[o + (my + dy + y) * S + mx + dx + x] > 255 - a.gap_luma)
 
-        # A real face moves its head while it talks, and a mouth cut from a
-        # frame where it had drifted leaves a ridge where the box meets the
-        # face. So split the frames into openness bands and, in each band,
-        # take the frame whose box *border* best matches the face's - the one
-        # where the head was in the same place.
-        ring = [i for i in range(n)
-                if min(i % mw, mw - 1 - i % mw, i // mw, mh - 1 - i // mw) < 4]
-        def drift(idx):
-            box = gray[idx * n:(idx + 1) * n]
-            return sum(abs(box[i] - base_box[i]) for i in ring) / len(ring)
-        picks = []
-        for k in range(a.levels):
-            band = scores[k * count // a.levels:(k + 1) * count // a.levels] or [scores[-1]]
-            best = min(band, key=lambda sc: drift(sc[1]))
-            picks.append(best)
-        print("# head drift at the box edge, per level: "
-              + " ".join(f"{drift(i):.1f}" for _, i in picks))
+        # The resting face: the frame with the smallest gap.
+        ref = min(range(count), key=gap_area)
 
-        base = ffmpeg("-i", square, "-vf",
-                      f"select='eq(n\\,{base_idx})',format=rgb565le",
-                      "-vframes", "1", "-f", "rawvideo", "-")
-        if len(base) != S * S * 2:
-            sys.exit(f"base frame is {len(base)} bytes, expected {S * S * 2}")
+        # A real face moves its head while it talks. Picking only frames where
+        # it happened to keep still gave tiny openings - the head moves most
+        # when the mouth opens widest - so instead every frame is lined up
+        # with the resting face before its mouth is cut out. The match is done
+        # on the face *around* the mouth (cheeks, moustache, chin), which moves
+        # with the head and not with the lips.
+        M = a.align
+        ctx = [(x, y) for y in range(my - M, my + mh + M, 2)
+               for x in range(mx - M, mx + mw + M, 2)
+               if not (mx + mw * 0.2 <= x < mx + mw * 0.8 and my + mh * 0.15 <= y < my + mh * 0.85)
+               and 0 <= x < S and 0 <= y < S]
+        rbase = [G[ref * S * S + y * S + x] for x, y in ctx]
+        def sad(f, dx, dy):
+            o = f * S * S
+            tot = 0
+            for (x, y), r in zip(ctx, rbase):
+                xx, yy = x + dx, y + dy
+                if 0 <= xx < S and 0 <= yy < S:
+                    tot += abs(G[o + yy * S + xx] - r)
+                else:
+                    tot += 64
+            return tot / len(ctx)
+        lim = a.align // 2
+        def align(f):
+            best = min(((sad(f, dx, dy), dx, dy)
+                        for dx in range(-lim, lim + 1, 2) for dy in range(-lim, lim + 1, 2)))
+            _, bx, by = best
+            best = min(((sad(f, dx, dy), dx, dy)
+                        for dx in (bx - 1, bx, bx + 1) for dy in (by - 1, by, by + 1)))
+            return best
+        fits = {}
+        for f in range(count):
+            r, dx, dy = align(f)
+            if (0 <= mx + dx and mx + dx + mw <= S and 0 <= my + dy and my + dy + mh <= S):
+                fits[f] = (r, dx, dy, gap_area(f, dx, dy))
+        if ref not in fits:
+            fits[ref] = (0.0, 0, 0, gap_area(ref))
 
-        rgb = ffmpeg("-i", square, "-vf",
-                     f"crop={mw}:{mh}:{mx}:{my},format=rgb565le",
-                     "-f", "rawvideo", "-")
-        per = mw * mh * 2
-        under = bytearray()                  # the face pixels each mouth covers
-        for y in range(mh):
-            o = ((my + y) * S + mx) * 2
-            under += base[o:o + mw * 2]
-        mouths = [feather(rgb[i * per:(i + 1) * per], bytes(under), mw, mh, a.feather)
-                  for _, i in picks]
+        # Keep the frames that line up well, then spread the shapes evenly from
+        # shut to the widest the clip reliably reaches.
+        good = sorted(fits, key=lambda f: fits[f][0])[:max(a.levels * 4, int(len(fits) * 0.6))]
+        areas = sorted(fits[f][3] for f in good)
+        top = areas[int(len(areas) * 0.95) - 1] if len(areas) > 20 else areas[-1]
+        print(f"# {count} frames, {len(good)} line up well; gap area 0 -> {top} px; "
+              f"residual of the kept frames <= {fits[good[-1]][0]:.1f}")
+        picks = [ref]
+        for k in range(1, a.levels):
+            target = top * k / (a.levels - 1)
+            cand = min((f for f in good if f not in picks),
+                       key=lambda f: abs(fits[f][3] - target) + 3.0 * fits[f][0])
+            picks.append(cand)
+        picks.sort(key=lambda f: fits[f][3])
+        print("# gap area per level (px): " + " ".join(str(fits[f][3]) for f in picks))
+        print("# alignment residual per level: " + " ".join(f"{fits[f][0]:.1f}" for f in picks))
+        print("# head shift per level (px): " + " ".join(f"{fits[f][1]:+d},{fits[f][2]:+d}" for f in picks))
+
+        base = C[ref * S * S * 2:(ref + 1) * S * S * 2]
+        def crop(f, dx, dy):
+            o = f * S * S * 2
+            out = bytearray()
+            for y in range(mh):
+                row = o + ((my + dy + y) * S + mx + dx) * 2
+                out += C[row:row + mw * 2]
+            return bytes(out)
+        under = crop(ref, 0, 0)
+        mouths = [feather(crop(f, fits[f][1], fits[f][2]), under, mw, mh, a.feather)
+                  for f in picks]
         write_header(a.out, S, mx, my, mw, mh, base, mouths)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

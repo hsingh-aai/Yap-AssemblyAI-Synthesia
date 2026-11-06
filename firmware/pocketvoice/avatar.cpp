@@ -1,67 +1,76 @@
-// A mouth that moves with the voice.
+// A face that talks while the agent talks.
 //
-// Jack's replies are written by an LLM about a second before he says them,
-// so no pre-rendered clip can ever be saying his words. What a pre-rendered
-// clip can give us is a face and a ladder of mouth shapes; this picks one
-// twenty times a second from the envelope of the audio that is sounding
-// right now. It never forms a real word and it does not need to - what reads
-// as speech is the mouth moving when the voice moves and shutting in the
-// gaps between words.
+// The first version swapped cut-out mouths by loudness. That works on a drawn
+// face and fails on a real one: a person's cheeks, moustache and chin move
+// when their mouth does, so each cut-out brought a different moment's face
+// with it and stepping between them shimmered, however the cut-outs were
+// picked (tools/ladderpop.py measures it). So this plays real video instead:
+// ~1.6 s of consecutive frames of the lower face, forwards then backwards
+// while the voice is going, so there is never a seam in time. The lips do not
+// form the agent's words; they move the way a person's do, and start and
+// stop with the voice.
 //
-// Two decisions do most of the work:
+// Two rules keep it from looking mechanical:
 //
-//  * Face and mouths are raw RGB565, pushed straight to the panel. The face
-//    was a JPEG once and drew nothing on hardware - see make_avatar.py for
-//    why - and a 128x76 mouth push costs about a millisecond either way.
-//  * The mouth is chosen from the playback *clock*, not from the block being
-//    queued. pumpSpeaker() runs up to 200 ms ahead of the speaker, and a
-//    mouth 200 ms early looks worse than no mouth at all.
+//  * It is clocked from playback, not from the queue. pumpSpeaker() runs up
+//    to 200 ms ahead of the speaker, so "is he talking now" is read from the
+//    sample actually sounding: (millis() - t0) * rate / 1000 into g_reply.
+//  * When the voice stops it keeps playing until it reaches a frame with the
+//    mouth shut, then holds there. Freezing mid-word leaves him gaping;
+//    cutting straight to shut is a jump.
 
 #include "pv.h"
 #include "avatar.h"
 
-static constexpr uint32_t kFrameMs = 50;        // 20 fps
-
-// After loudenUp() the reply is gain-5 and soft-limited, so the loud end is
-// squeezed into very little range. A hand-set ladder keeps the gaps between
-// words doing the work, which is where a mouth actually reads.
-static const int32_t kStep[kMouthLevels - 1] = {
-  1500, 6000, 12000, 19000, 26000,
-};
+static constexpr uint32_t kFrameMs   = 1000 / kTalkFps;  // the recording's own pace
+static constexpr uint32_t kWinMs     = 20;               // RMS window
+static constexpr float    kSmooth    = 0.35f;            // per-frame envelope smoothing
+static constexpr float    kGate      = 400.0f;           // RMS above this is voice
+static constexpr uint32_t kHangMs    = 180;              // a gap shorter than this is not a pause
 
 static uint32_t s_t0;        // millis() at which the first sample sounded
 static uint32_t s_last;      // last frame drawn
-static int32_t  s_env;       // smoothed envelope
-static int      s_level;
+static uint32_t s_voiced_at; // last time the voice was above the gate
+static float    s_env;
+static int      s_idx;       // frame of the loop on screen
+static int      s_dir;       // +1 forwards, -1 backwards
 static int      s_ox, s_oy;  // where the face sits on the round display
 
-static void blit(int level) {
-  M5.Display.pushImage(s_ox + kMouthX, s_oy + kMouthY, kMouthW, kMouthH,
-                       kMouthPix[level]);
+static void blit(int i) {
+  M5.Display.pushImage(s_ox + kTalkX, s_oy + kTalkY, kTalkW, kTalkH, kTalkPix[i]);
+}
+
+static void step() {
+  if (s_idx + s_dir < 0 || s_idx + s_dir >= kTalkFrames) s_dir = -s_dir;
+  s_idx += s_dir;
+  blit(s_idx);
 }
 
 void avatarShow() {
   // A 300 px square inscribes in this 434 px circle with room to spare; the
   // small lift keeps the chin clear of the hint line, and the corners that
-  // fall outside the glass are background colour anyway.
+  // fall outside the glass are background anyway.
   s_ox = cx - kAvatarSize / 2;
   s_oy = cy - kAvatarSize / 2 - 24;
   M5.Display.pushImage(s_ox, s_oy, kAvatarSize, kAvatarSize, kAvatarBasePix);
-  s_level = 0;
-  s_env = 0;
+  s_idx = 0;
+  s_dir = 1;
+  s_env = 0.0f;
   s_t0 = 0;
   s_last = 0;
+  s_voiced_at = 0;
 }
 
 void avatarStart(uint32_t t0) {
   s_t0 = t0;
-  s_env = 0;
+  s_env = 0.0f;
 }
 
 void avatarRest() {
   s_t0 = 0;
-  s_env = 0;
-  if (s_level != 0) { s_level = 0; blit(0); }
+  s_env = 0.0f;
+  // Settle on the loop's first frame, which is the resting face itself.
+  if (s_idx != 0) { s_idx = 0; s_dir = 1; blit(0); }
 }
 
 void avatarAnimate(const int16_t* pcm, size_t have, uint32_t rate) {
@@ -72,22 +81,17 @@ void avatarAnimate(const int16_t* pcm, size_t have, uint32_t rate) {
   s_last = now;
 
   const size_t at = (size_t)((uint64_t)(now - s_t0) * rate / 1000);
-  if (at >= have) { avatarRest(); return; }
-
-  const size_t win = rate / 40;                 // 25 ms of audio
-  const size_t end = at + win < have ? at + win : have;
-  int32_t peak = 0;
-  for (size_t i = at; i < end; ++i) {
-    const int32_t v = pcm[i] < 0 ? -pcm[i] : pcm[i];
-    if (v > peak) peak = v;
+  float rms = 0.0f;
+  if (at < have) {
+    const size_t win = rate * kWinMs / 1000;
+    const size_t end = at + win < have ? at + win : have;
+    float sum = 0.0f;
+    for (size_t i = at; i < end; ++i) sum += (float)pcm[i] * pcm[i];
+    rms = end > at ? sqrtf(sum / (float)(end - at)) : 0.0f;
   }
+  s_env += (rms - s_env) * kSmooth;
+  if (s_env > kGate) s_voiced_at = now;
 
-  // Fast attack, slow release. A mouth that tracks the samples exactly
-  // flickers; one that snaps open and eases shut reads as speech.
-  if (peak > s_env) s_env = peak;
-  else              s_env -= (s_env - peak) / 3;
-
-  int level = 0;
-  while (level < kMouthLevels - 1 && s_env > kStep[level]) ++level;
-  if (level != s_level) { s_level = level; blit(level); }
+  const bool talking = s_voiced_at && now - s_voiced_at < kHangMs;
+  if (talking || kTalkGap[s_idx] > kTalkShut) step();
 }
